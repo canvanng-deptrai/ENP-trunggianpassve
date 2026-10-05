@@ -67,8 +67,25 @@ tailwind.config = {
 <div id="modalRoot"></div>
 <div id="toastRoot" class="fixed left-1/2 -translate-x-1/2 bottom-5 z-50 grid gap-2" aria-live="polite"></div>
 
-<script>
+<script type="module">
 'use strict';
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
+import { getFirestore, collection, doc, setDoc, updateDoc, getDoc, getDocs, onSnapshot, query, orderBy, limit } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBiO3RXjpMJwp-iTKWZmgY0SATtQ_m9Se8",
+  authDomain: "enp-trunggianpassve-a9562.firebaseapp.com",
+  projectId: "enp-trunggianpassve-a9562",
+  storageBucket: "enp-trunggianpassve-a9562.firebasestorage.app",
+  messagingSenderId: "762270281318",
+  appId: "1:762270281318:web:c1724bde29d61bb3be87a7",
+  measurementId: "G-Z3B8QQFN26"
+};
+const fbApp = initializeApp(firebaseConfig);
+const auth = getAuth(fbApp);
+const dbFs = getFirestore(fbApp);
+
 const $=(s,r)=>(r||document).querySelector(s);
 const $all=(s,r)=>[...(r||document).querySelectorAll(s)];
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -79,7 +96,6 @@ const rid=(p)=>(p||'')+Math.random().toString(36).slice(2,7).toUpperCase();
 /* ================= SETTINGS & CONSTANTS ================= */
 const settings={ feePercent:2, fixedFee:3000, partnerFeePercent:0.6, autoCompleteHours:48, apiKey:'pk_live_mm_7f2a...e91c', apiSecret:'••••••••••••••••' };
 const ADMIN_PASSCODE='ADMIN2026';
-const FALLBACK_BUYER='local-buyer', FALLBACK_SELLER='local-seller';
 
 const STATUS = {
   CREATED:{label:'Khởi tạo',color:'navy'},
@@ -103,31 +119,24 @@ function computeFees(amount,feePayer){
   return {platformFee,partnerFee,feeTotal,buyerTotal,sellerReceive};
 }
 
-/* ================= DATA LAYER (db capability) ================= */
-let db=null, userCap=null, myId=null, mySellerPayout=null, booted=false;
+/* ================= DATA LAYER (Firebase: Auth ẩn danh + Firestore) ================= */
+let myId=null, mySellerPayout=null, booted=false;
 let orders=[], webhookLog=[]; let seq=1000;
 let writeChains=Object.create(null);
 
-function effectiveId(role){
-  if(myId) return myId;
-  return role==='buyer'?FALLBACK_BUYER:FALLBACK_SELLER;
-}
 function persistOrder(o,patch){
-  if(!db) return;
   const id=o.id, prev=writeChains[id]||Promise.resolve();
-  writeChains[id]=prev.then(()=>db.collection('orders').doc(id).update(patch)).catch(e=>console.error('order update failed',e));
+  writeChains[id]=prev.then(()=>updateDoc(doc(dbFs,'orders',id),patch)).catch(e=>console.error('order update failed',e));
 }
 function persistNewOrder(o){
-  if(!db) return;
-  db.collection('orders').doc(o.id).set(o).catch(e=>console.error('order create failed',e));
+  setDoc(doc(dbFs,'orders',o.id), o).catch(e=>console.error('order create failed',e));
 }
 function persistLog(entry){
-  if(!db) return;
-  db.collection('webhooklog').doc(entry.id).set(entry).catch(e=>console.error('log write failed',e));
+  setDoc(doc(dbFs,'webhooklog',entry.id), entry).catch(e=>console.error('log write failed',e));
 }
 function persistPayout(payout){
-  if(!db||!myId) return;
-  db.doc('data/users/'+myId+'/payout').set(payout).catch(e=>console.error('payout save failed',e));
+  if(!myId) return;
+  setDoc(doc(dbFs,'users',myId,'private','payout'), payout).catch(e=>console.error('payout save failed',e));
 }
 function logEvent(orderId,partner,type,status,payload){
   const entry={id:'EVT'+(++seq),orderId,partner,type,status,ts:Date.now(),sig:true,payload};
@@ -149,25 +158,24 @@ function joinRoom(code,pass,role,displayName){
   const o=orders.find(x=>x.roomCode===(code||'').trim().toUpperCase());
   if(!o) return {ok:false,msg:'Không tìm thấy phòng với mã này.'};
   if((o.roomPassword||'').toLowerCase()!==(pass||'').trim().toLowerCase()) return {ok:false,msg:'Mật khẩu không khớp với mã phòng này — kiểm tra lại với đối tác giao dịch.'};
-  const id=effectiveId(role);
+  if(!myId) return {ok:false,msg:'Đang kết nối tài khoản, thử lại sau vài giây.'};
   if(role==='buyer'){
-    if(myId && o.sellerUserId===myId) return {ok:false,msg:'Tài khoản của bạn đang là người bán của phòng này — không thể đồng thời là người mua.'};
-    if(o.buyerUserId && o.buyerUserId!==id) return {ok:false,msg:'Phòng này đã có người mua khác.'};
-    o.buyerUserId=id; if(displayName) o.buyerName=displayName;
-    persistOrder(o,{buyerUserId:id,buyerName:o.buyerName});
+    if(o.sellerUserId===myId) return {ok:false,msg:'Tài khoản của bạn đang là người bán của phòng này — không thể đồng thời là người mua.'};
+    if(o.buyerUserId && o.buyerUserId!==myId) return {ok:false,msg:'Phòng này đã có người mua khác.'};
+    o.buyerUserId=myId; if(displayName) o.buyerName=displayName;
+    persistOrder(o,{buyerUserId:myId,buyerName:o.buyerName});
   } else {
-    if(myId && o.buyerUserId===myId) return {ok:false,msg:'Tài khoản của bạn đang là người mua của phòng này — không thể đồng thời là người bán.'};
-    if(o.sellerUserId && o.sellerUserId!==id) return {ok:false,msg:'Phòng này đã có người bán khác tham gia.'};
-    o.sellerUserId=id; if(displayName) o.sellerName=displayName;
-    persistOrder(o,{sellerUserId:id,sellerName:o.sellerName});
+    if(o.buyerUserId===myId) return {ok:false,msg:'Tài khoản của bạn đang là người mua của phòng này — không thể đồng thời là người bán.'};
+    if(o.sellerUserId && o.sellerUserId!==myId) return {ok:false,msg:'Phòng này đã có người bán khác tham gia.'};
+    o.sellerUserId=myId; if(displayName) o.sellerName=displayName;
+    persistOrder(o,{sellerUserId:myId,sellerName:o.sellerName});
   }
   return {ok:true,order:o};
 }
 function orderOf(id){ return orders.find(o=>o.id===id); }
 function myOrders(role){
-  const id=effectiveId(role);
-  if(role==='buyer') return orders.filter(o=>o.buyerUserId===id);
-  return orders.filter(o=>o.sellerUserId===id);
+  if(role==='buyer') return orders.filter(o=>o.buyerUserId===myId);
+  return orders.filter(o=>o.sellerUserId===myId);
 }
 
 function demoSeedData(){
@@ -185,41 +193,43 @@ function demoSeedData(){
   ];
   return {orders:[o1,o2,o3],logs};
 }
-async function seedRemote(){
+async function seedIfEmpty(){
+  try{
+    const existing = await getDocs(query(collection(dbFs,'orders'), limit(1)));
+    if(!existing.empty) return;
+  }catch(e){ console.error('seed check failed',e); return; }
   const {orders:demo,logs}=demoSeedData();
-  for(const o of demo){ try{ await db.collection('orders').doc(o.id).set(o); }catch(e){ console.error('seed order failed',e); } }
-  for(const l of logs){ try{ await db.collection('webhooklog').doc(l.id).set(l); }catch(e){ console.error('seed log failed',e); } }
-}
-function seedLocal(){
-  const {orders:demo,logs}=demoSeedData();
-  orders=demo; webhookLog=logs.slice().sort((a,b)=>b.ts-a.ts); seq=1004;
+  for(const o of demo){ try{ await setDoc(doc(dbFs,'orders',o.id), o); }catch(e){ console.error('seed order failed',e); } }
+  for(const l of logs){ try{ await setDoc(doc(dbFs,'webhooklog',l.id), l); }catch(e){ console.error('seed log failed',e); } }
 }
 async function boot(){
-  try{ db = await window.claude.use('db'); }catch(e){ db=null; }
-  try{ userCap = await window.claude.use('user'); }catch(e){ userCap=null; }
-  if(userCap){ try{ myId = await userCap.id(); }catch(e){ myId=null; } }
-  if(db){
-    try{
-      const existing = await db.collection('orders').limit(1).get();
-      if(existing.empty) await seedRemote();
-    }catch(e){ console.error('seed check failed',e); }
-    db.collection('orders').onSnapshot(snap=>{
-      orders = snap.docs.map(d=>({id:d.id, ...d.data()}));
-      if(booted) render();
-    }, e=>console.error('orders snapshot error',e));
-    db.collection('webhooklog').onSnapshot(snap=>{
-      webhookLog = snap.docs.map(d=>({id:d.id, ...d.data()})).sort((a,b)=>b.ts-a.ts);
-      if(booted) render();
-    }, e=>console.error('log snapshot error',e));
-    if(myId){
-      try{ const p=await db.doc('data/users/'+myId+'/payout').get(); if(p.exists) mySellerPayout=p.data(); }catch(e){}
-    }
-  } else {
-    seedLocal();
+  await new Promise(resolve=>{
+    onAuthStateChanged(auth, async (user)=>{
+      if(user){ myId=user.uid; resolve(); return; }
+      try{ const cred=await signInAnonymously(auth); myId=cred.user.uid; }
+      catch(e){ console.error('đăng nhập ẩn danh thất bại',e); myId=null; }
+      resolve();
+    });
+  });
+
+  await seedIfEmpty();
+
+  onSnapshot(collection(dbFs,'orders'), snap=>{
+    orders = snap.docs.map(d=>({id:d.id, ...d.data()}));
+    if(booted) render();
+  }, e=>console.error('orders snapshot error',e));
+
+  onSnapshot(query(collection(dbFs,'webhooklog'), orderBy('ts','desc'), limit(50)), snap=>{
+    webhookLog = snap.docs.map(d=>({id:d.id, ...d.data()}));
+    if(booted) render();
+  }, e=>console.error('log snapshot error',e));
+
+  if(myId){
+    try{ const p=await getDoc(doc(dbFs,'users',myId,'private','payout')); if(p.exists()) mySellerPayout=p.data(); }catch(e){}
   }
   booted=true;
   const sb=$('#syncBadge');
-  if(sb) sb.textContent = db ? (myId?'Đồng bộ trực tiếp — bạn và đối tác giao dịch dùng chung dữ liệu':'Cần đăng nhập để đồng bộ với đối tác') : 'Chế độ xem thử một mình — chưa đồng bộ nhiều người';
+  if(sb) sb.textContent = myId ? 'Đồng bộ trực tiếp qua Firebase — bạn và đối tác giao dịch dùng chung dữ liệu' : 'Không kết nối được Firebase — thử tải lại trang';
   render();
 }
 
@@ -268,7 +278,7 @@ function roleGate(){
     </div>
     <h1 class="text-3xl font-extrabold text-navy-800 mb-2">Bạn đến đây để mua hay bán vé?</h1>
     <p class="text-navy-400 mb-2">Chọn vai trò để bắt đầu. Tiền giao dịch được đối tác thanh toán giữ hộ cho đến khi cả hai bên xác nhận.</p>
-    <p class="text-xs text-navy-300 mb-8">${db?(myId?'Dữ liệu được đồng bộ trực tiếp với đối tác giao dịch của bạn.':'Mở trang này ở chế độ đã xuất bản và đăng nhập để đồng bộ với đối tác thật.'):'Đang xem thử một mình (chưa xuất bản) — bật vai trò Người mua/Người bán để tự mô phỏng cả hai phía.'}</p>
+    <p class="text-xs text-navy-300 mb-8">${myId?'Dữ liệu được đồng bộ trực tiếp qua Firebase với đối tác giao dịch của bạn — mở link này trên một trình duyệt khác để đóng vai đối tác.':'Đang kết nối Firebase… nếu dòng này không biến mất, hãy tải lại trang.'}</p>
     <div class="grid sm:grid-cols-2 gap-4">
       <button data-act="pickRole" data-role="buyer" class="bg-white rounded-2xl shadow-card p-6 text-left hover:ring-2 hover:ring-mint-400 transition">
         <div class="text-3xl mb-2">🎟️</div><div class="font-extrabold text-lg mb-1">Tôi là Người mua</div><div class="text-sm text-navy-400">Tạo phòng, thanh toán ký quỹ và nhận vé an toàn.</div></button>
